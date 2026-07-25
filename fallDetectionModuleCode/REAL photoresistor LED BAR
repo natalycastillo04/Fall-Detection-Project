@@ -1,8 +1,8 @@
 #include <Adafruit_NeoPixel.h>
 
-const int LED_PIN = 11;        
+const int LED_PIN = 11;
 const int NUMPIXELS = 8;
-const int LDR_PIN = A0;        
+const int LDR_PIN = A0;
 const int DARK_THRESHOLD = 200;
 
 Adafruit_NeoPixel pixels(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
@@ -19,20 +19,16 @@ void loop() {
   Serial.println(lightLevel);
 
   if (lightLevel < DARK_THRESHOLD) {
-    // It's dark - run the animation
+    // Dark: Turn all LEDs red
     for (int i = 0; i < NUMPIXELS; i++) {
       pixels.setPixelColor(i, pixels.Color(255, 0, 0)); // Red
-      pixels.show();
-      delay(500);
-
-      pixels.setPixelColor(i, pixels.Color(0, 0, 0));   // Off
-      pixels.show();
-      delay(500);
     }
+    pixels.show();
   } else {
-    // It's bright - turn all LEDs off
+    // Bright: Turn all LEDs off
     pixels.clear();
     pixels.show();
-    delay(100);
   }
+
+  delay(100);
 }
