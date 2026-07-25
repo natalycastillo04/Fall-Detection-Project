@@ -1,0 +1,38 @@
+#include <Adafruit_NeoPixel.h>
+
+const int LED_PIN = 11;        
+const int NUMPIXELS = 8;
+const int LDR_PIN = A0;        
+const int DARK_THRESHOLD = 200;
+
+Adafruit_NeoPixel pixels(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+void setup() {
+  pixels.begin();
+  pixels.clear();
+  pixels.show();
+  Serial.begin(9600);
+}
+
+void loop() {
+  int lightLevel = analogRead(LDR_PIN);
+  Serial.println(lightLevel);
+
+  if (lightLevel < DARK_THRESHOLD) {
+    // It's dark - run the animation
+    for (int i = 0; i < NUMPIXELS; i++) {
+      pixels.setPixelColor(i, pixels.Color(255, 0, 0)); // Red
+      pixels.show();
+      delay(500);
+
+      pixels.setPixelColor(i, pixels.Color(0, 0, 0));   // Off
+      pixels.show();
+      delay(500);
+    }
+  } else {
+    // It's bright - turn all LEDs off
+    pixels.clear();
+    pixels.show();
+    delay(100);
+  }
+}
