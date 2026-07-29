@@ -1,4 +1,7 @@
 #include <Adafruit_NeoPixel.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
 
 // Buzzer
 const int buzzerPin = 8;
@@ -7,28 +10,38 @@ const int buzzerPin = 8;
 const int echoPin = 9;
 const int trigPin = 10;
 const int motionThresh = 20;
+float motionDetect();
 
 // Automatic LED LightBar
 const int ledPin = 11;
 const int numPixels = 8;
 const int ldrPin = A0;
 const int darkThresh = 200;
-
-// Accelerometer
-
-
-
 Adafruit_NeoPixel pixels(numPixels, ledPin, NEO_GRBW + NEO_KHZ800);
 void neopixelStick(int lightLevel, float distance);
-float motionDetect();
-void fallDetect();
-void serialMonitor(int lightLevel, float distance);
 void strobe();
 
+
+// Accelerometer
+Adafruit_MPU6050 acc; 
+const float freeFallThresh = 0.45;
+float accelMag = 1.0;
+bool fallDetect();
+
+// Button
+const int buttonPin = 2;
+bool lastButtonState;
+bool systemOn = false;
+
+void serialMonitor(int lightLevel, float distance, bool fall);
 // SETUP
 void setup() 
 {
   Serial.begin(9600);
+
+  // Button
+  pinMode(buttonPin, INPUT_PULLUP);
+  lastButtonState = digitalRead(buttonPin);
 
   // LED Bar Setup
   pixels.begin();
@@ -47,47 +60,107 @@ void setup()
 
 // Accelerometer Setup
   pinMode(buzzerPin, OUTPUT);
+
+  if (!acc.begin()) 
+  {
+    Serial.println("MPU6050 not found!");
+    while (1);
+  }
+  
+  acc.setAccelerometerRange(MPU6050_RANGE_4_G);
+  acc.setGyroRange(MPU6050_RANGE_500_DEG);
+  acc.setFilterBandwidth(MPU6050_BAND_21_HZ);
 }
 
 // LOOP
-void loop() 
+void loop()
 {
-  float distance = motionDetect();
+  // ---------- Button Toggle ----------
+  bool buttonState = digitalRead(buttonPin);
 
+  // Detect a new button press
+  if (lastButtonState == HIGH && buttonState == LOW)
+  {
+    systemOn = !systemOn;   // Toggle ON/OFF
+
+    if (systemOn)
+      Serial.println("SYSTEM ON");
+    else
+    {
+      Serial.println("SYSTEM OFF");
+      noTone(buzzerPin);
+      pixels.clear();
+      pixels.show();
+    }
+
+    delay(50);   // Simple debounce
+  }
+
+  lastButtonState = buttonState;
+
+  // If OFF, do nothing
+  if (!systemOn)
+  {
+    return;
+  }
+
+  // ---------- Your Original Code ----------
+  float distance = motionDetect();
   int lightLevel = analogRead(ldrPin);
+  bool fall = fallDetect();
+
   neopixelStick(lightLevel, distance);
 
-  serialMonitor(lightLevel, distance);
+ 
+  static bool lastFall = false;
 
-  delay(50);
+  if (fall && !lastFall)
+  {
+      Serial.println("FREE FALL DETECTED!");
+  }
+
+  lastFall = fall;
+  
+
+  serialMonitor(lightLevel, distance, fall);
+
+  delay(10);
 }
+
+
 
 // LED Bar
 void neopixelStick(int lightLevel, float distance)
 {
+  // Motion detected: flash red and buzz
   if (distance <= motionThresh)
   {
     strobe();
-  }
-  else if (lightLevel < darkThresh) 
-  {
-    // Dark: Turn all LEDs on
-    for (int i = 0; i < numPixels; i++) 
-    {
-      pixels.setPixelColor(i, pixels.Color(0, 0, 0, 255)); // white
-    }
-    pixels.show();
+    return;
   }
 
+  // Motion stopped: make sure buzzer is off
+  noTone(buzzerPin);
+
+  // Dark: solid white LEDs
+  if (lightLevel < darkThresh)
+  {
+    for (int i = 0; i < numPixels; i++)
+    {
+      pixels.setPixelColor(i, pixels.Color(0, 0, 0, 255));
+    }
+
+    pixels.setBrightness(150);
+    pixels.show();
+  }
+  // Bright: only middle green LEDs
   else
   {
-    // Bright: Turn all LEDs off
     pixels.clear();
     pixels.setPixelColor(3, pixels.Color(0, 255, 0));
     pixels.setPixelColor(4, pixels.Color(0, 255, 0));
     pixels.setBrightness(50);
     pixels.show();
-
   }
 }
 
@@ -116,36 +189,50 @@ float motionDetect()
   return distance;
 }
 
-void fallDetect()
+// ACCEL
+bool fallDetect()
 {
+  sensors_event_t a, g, temp;
+  acc.getEvent(&a, &g, &temp);
 
+  float ax = a.acceleration.x / 9.81;
+  float ay = a.acceleration.y / 9.81;
+  float az = a.acceleration.z / 9.81;
 
+  accelMag = sqrt(ax * ax + ay * ay + az * az);
 
-
+  return (accelMag <= freeFallThresh);
 }
 
 void strobe()
 {
   static bool on = false;
+  static unsigned long lastFlash = 0;
 
-  on = !on;   // Flip between ON and OFF
-
-  if (on)
+  if (millis() - lastFlash >= 75)
   {
-    for (int i = 0; i < numPixels; i++)
-      pixels.setPixelColor(i, pixels.Color(255, 0, 0));
-  }
-  else
-  {
-    pixels.clear();
-  }
+    lastFlash = millis();
+    on = !on;
 
-  pixels.show();
+    if (on)
+    {
+      for (int i = 0; i < numPixels; i++)
+        pixels.setPixelColor(i, pixels.Color(255, 0, 0));
 
-  delay(75);   // Flash speed
+      tone(buzzerPin, 1000);   // Buzzer ON
+    }
+    else
+    {
+      pixels.clear();
+      noTone(buzzerPin);       // Buzzer OFF
+    }
+
+    pixels.show();
+  }
 }
 
-void serialMonitor(int lightLevel, float distance)
+
+void serialMonitor(int lightLevel, float distance, bool fall)
 {
   Serial.print("LDR: ");
   Serial.print(lightLevel);
@@ -154,7 +241,7 @@ void serialMonitor(int lightLevel, float distance)
   Serial.print(distance, 1);
   Serial.print(" cm");
 
-  Serial.print(" | LEDs: ");
+  Serial.print(" | Light: ");
   if (lightLevel < darkThresh)
     Serial.print("WHITE");
   else
@@ -162,6 +249,16 @@ void serialMonitor(int lightLevel, float distance)
 
   Serial.print(" | Motion: ");
   if (distance <= motionThresh)
+    Serial.print("YES");
+  else
+    Serial.print("NO");
+
+  Serial.print(" | Accel: ");
+  Serial.print(accelMag, 2);
+  Serial.print(" g");
+
+  Serial.print(" | Fall: ");
+  if (fall)
     Serial.println("YES");
   else
     Serial.println("NO");
