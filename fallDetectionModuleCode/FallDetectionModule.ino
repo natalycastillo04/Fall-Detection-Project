@@ -17,12 +17,12 @@ void playSOS();
 
 //UltraSonic Sensor
 const int echoPin = 10;
-const int trigPin = 9;
+const int trigPin = 11;
 const int motionThresh = 20;
 float motionDetect();
 
 // Automatic LED LightBar
-const int ledPin = 11;
+const int ledPin = 9;
 const int numPixels = 8;
 const int ldrPin = A0;
 const int darkThresh = 200;
