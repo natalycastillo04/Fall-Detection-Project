@@ -4,7 +4,7 @@
 #include <Wire.h>
 
 // Buzzer
-const int buzzerPin = 8;
+const int buzzerPin = 13;
 
 // SOS
 const int cancelButtonPin = 3;
