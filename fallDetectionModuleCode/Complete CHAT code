@@ -1,0 +1,451 @@
+#include <Adafruit_NeoPixel.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
+
+// ============================================================
+// JUNO walker/cane safety module
+// Priority: Fall/SOS > obstacle warning > automatic lighting
+// ============================================================
+
+// Pins
+constexpr uint8_t POWER_BUTTON_PIN = 6;
+constexpr uint8_t CANCEL_BUTTON_PIN = 7;
+constexpr uint8_t LED_PIN = 9;
+constexpr uint8_t ECHO_PIN = 10;
+constexpr uint8_t TRIG_PIN = 11;
+constexpr uint8_t BUZZER_PIN = 13;
+constexpr uint8_t LDR_PIN = A0;
+
+// NeoPixel / light settings
+constexpr uint8_t NUM_PIXELS = 8;
+constexpr uint8_t LED_BRIGHTNESS = 150;
+constexpr int DARK_THRESHOLD = 200;
+
+// Ultrasonic settings
+constexpr float OBSTACLE_THRESHOLD_CM = 20.0f;
+constexpr uint32_t ECHO_TIMEOUT_US = 25000;
+
+// Fall settings
+constexpr float FREE_FALL_THRESHOLD_G = 0.45f;
+constexpr uint32_t FREE_FALL_MIN_MS = 100;
+constexpr float IMPACT_THRESHOLD_G = 2.0f;
+constexpr uint32_t IMPACT_WINDOW_MS = 1200;
+constexpr uint32_t FALL_COOLDOWN_MS = 5000;
+
+// Other timing
+constexpr uint32_t DEBOUNCE_MS = 30;
+constexpr uint32_t STROBE_INTERVAL_MS = 75;
+constexpr uint32_t SERIAL_INTERVAL_MS = 250;
+constexpr uint16_t BUZZER_FREQUENCY = 1000;
+
+// SOS Morse timing
+constexpr uint16_t DOT_MS = 150;
+constexpr uint16_t DASH_MS = 450;
+constexpr uint16_t ELEMENT_GAP_MS = 150;
+constexpr uint16_t LETTER_GAP_MS = 450;
+constexpr uint16_t REPEAT_GAP_MS = 1000;
+
+const uint16_t SOS_PATTERN[] = {
+  DOT_MS, DOT_MS, DOT_MS,
+  DASH_MS, DASH_MS, DASH_MS,
+  DOT_MS, DOT_MS, DOT_MS
+};
+constexpr uint8_t SOS_COUNT = sizeof(SOS_PATTERN) / sizeof(SOS_PATTERN[0]);
+
+Adafruit_NeoPixel pixels(NUM_PIXELS, LED_PIN, NEO_GRBW + NEO_KHZ800);
+Adafruit_MPU6050 mpu;
+
+enum class SystemMode : uint8_t { OFF, NORMAL, SOS };
+enum class FallStage : uint8_t { MONITORING, FREE_FALL, WAITING_FOR_IMPACT, COOLDOWN };
+enum class LedMode : uint8_t { UNKNOWN, OFF, READY, WHITE, RED, BLUE };
+
+struct Button {
+  explicit Button(uint8_t buttonPin) : pin(buttonPin) {}
+
+  uint8_t pin;
+  bool stableState = HIGH;
+  bool lastReading = HIGH;
+  uint32_t lastChange = 0;
+
+  void begin() {
+    pinMode(pin, INPUT_PULLUP);
+    stableState = digitalRead(pin);
+    lastReading = stableState;
+  }
+
+  bool pressed() {
+    const bool reading = digitalRead(pin);
+    const uint32_t now = millis();
+
+    if (reading != lastReading) {
+      lastReading = reading;
+      lastChange = now;
+    }
+
+    if (reading != stableState && now - lastChange >= DEBOUNCE_MS) {
+      stableState = reading;
+      return stableState == LOW;
+    }
+
+    return false;
+  }
+};
+
+Button powerButton(POWER_BUTTON_PIN);
+Button cancelButton(CANCEL_BUTTON_PIN);
+
+SystemMode systemMode = SystemMode::OFF;
+FallStage fallStage = FallStage::MONITORING;
+LedMode currentLedMode = LedMode::UNKNOWN;
+
+float distanceCm = 999.0f;
+float accelMagnitudeG = 1.0f;
+int lightLevel = 0;
+
+bool buzzerOn = false;
+bool strobeOn = false;
+uint32_t lastStrobeChange = 0;
+uint32_t lastSerialPrint = 0;
+uint32_t fallStageStarted = 0;
+
+uint8_t sosIndex = 0;
+bool sosSignalOn = false;
+uint32_t sosPhaseStarted = 0;
+uint16_t sosPhaseDuration = 0;
+
+void setLedMode(LedMode mode);
+void setBuzzer(bool on);
+float readDistanceCm();
+bool detectFall();
+void updateNormalOutputs();
+void updateSOS();
+void startSOS();
+void cancelSOS();
+void turnSystemOn();
+void turnSystemOff();
+void printStatus();
+
+void setup() {
+  Serial.begin(9600);
+  Serial1.begin(9600);  // XBee using UNO R4 hardware UART
+
+  powerButton.begin();
+  cancelButton.begin();
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
+
+  pixels.begin();
+  pixels.setBrightness(LED_BRIGHTNESS);
+  setLedMode(LedMode::OFF);
+
+  Wire.begin();
+
+  if (!mpu.begin()) {
+    Serial.println("ERROR: MPU6050 not found. Check SDA, SCL, power, and ground.");
+
+    while (true) {
+      setLedMode(LedMode::RED);
+      delay(250);
+      setLedMode(LedMode::OFF);
+      delay(250);
+    }
+  }
+
+  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  Serial.println("JUNO ready. Press the power button.");
+}
+
+void loop() {
+  // Power button always works, including during SOS.
+  if (powerButton.pressed()) {
+    if (systemMode == SystemMode::OFF) {
+      turnSystemOn();
+    } else {
+      turnSystemOff();
+    }
+  }
+
+  if (systemMode == SystemMode::OFF) {
+    return;
+  }
+
+  // SOS has the highest priority.
+  if (systemMode == SystemMode::SOS) {
+    updateSOS();
+    return;
+  }
+
+  distanceCm = readDistanceCm();
+  lightLevel = analogRead(LDR_PIN);
+
+  if (detectFall()) {
+    startSOS();
+    updateSOS();
+    return;
+  }
+
+  updateNormalOutputs();
+
+  if (millis() - lastSerialPrint >= SERIAL_INTERVAL_MS) {
+    lastSerialPrint = millis();
+    printStatus();
+  }
+}
+
+void turnSystemOn() {
+  systemMode = SystemMode::NORMAL;
+  fallStage = FallStage::MONITORING;
+  fallStageStarted = millis();
+  setBuzzer(false);
+  setLedMode(LedMode::READY);
+
+  Serial.println("SYSTEM ON");
+  Serial1.println("SYSTEM:ON");
+}
+
+void turnSystemOff() {
+  systemMode = SystemMode::OFF;
+  setBuzzer(false);
+  setLedMode(LedMode::OFF);
+
+  Serial.println("SYSTEM OFF");
+  Serial1.println("SYSTEM:OFF");
+}
+
+float readDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  const uint32_t duration = pulseIn(ECHO_PIN, HIGH, ECHO_TIMEOUT_US);
+
+  if (duration == 0) {
+    return 999.0f;  // No echo received
+  }
+
+  return duration * 0.0343f / 2.0f;
+}
+
+bool detectFall() {
+  sensors_event_t acceleration;
+  sensors_event_t gyro;
+  sensors_event_t temperature;
+
+  if (!mpu.getEvent(&acceleration, &gyro, &temperature)) {
+    return false;
+  }
+
+  const float ax = acceleration.acceleration.x / SENSORS_GRAVITY_STANDARD;
+  const float ay = acceleration.acceleration.y / SENSORS_GRAVITY_STANDARD;
+  const float az = acceleration.acceleration.z / SENSORS_GRAVITY_STANDARD;
+
+  accelMagnitudeG = sqrt(ax * ax + ay * ay + az * az);
+  const uint32_t now = millis();
+
+  switch (fallStage) {
+    case FallStage::MONITORING:
+      if (accelMagnitudeG <= FREE_FALL_THRESHOLD_G) {
+        fallStage = FallStage::FREE_FALL;
+        fallStageStarted = now;
+      }
+      break;
+
+    case FallStage::FREE_FALL:
+      if (accelMagnitudeG > FREE_FALL_THRESHOLD_G) {
+        fallStage = FallStage::MONITORING;
+      } else if (now - fallStageStarted >= FREE_FALL_MIN_MS) {
+        fallStage = FallStage::WAITING_FOR_IMPACT;
+        fallStageStarted = now;
+      }
+      break;
+
+    case FallStage::WAITING_FOR_IMPACT:
+      if (accelMagnitudeG >= IMPACT_THRESHOLD_G) {
+        fallStage = FallStage::COOLDOWN;
+        fallStageStarted = now;
+        return true;
+      }
+
+      if (now - fallStageStarted >= IMPACT_WINDOW_MS) {
+        fallStage = FallStage::MONITORING;
+      }
+      break;
+
+    case FallStage::COOLDOWN:
+      if (now - fallStageStarted >= FALL_COOLDOWN_MS) {
+        fallStage = FallStage::MONITORING;
+      }
+      break;
+  }
+
+  return false;
+}
+
+void updateNormalOutputs() {
+  const bool obstacleDetected =
+    distanceCm > 0.0f && distanceCm <= OBSTACLE_THRESHOLD_CM;
+
+  if (obstacleDetected) {
+    const uint32_t now = millis();
+
+    if (now - lastStrobeChange >= STROBE_INTERVAL_MS) {
+      lastStrobeChange = now;
+      strobeOn = !strobeOn;
+      setLedMode(strobeOn ? LedMode::RED : LedMode::OFF);
+      setBuzzer(strobeOn);
+    }
+
+    return;
+  }
+
+  setBuzzer(false);
+
+  if (lightLevel < DARK_THRESHOLD) {
+    setLedMode(LedMode::WHITE);
+  } else {
+    setLedMode(LedMode::READY);
+  }
+}
+
+void startSOS() {
+  systemMode = SystemMode::SOS;
+  setBuzzer(false);
+
+  sosIndex = 0;
+  sosSignalOn = false;
+  sosPhaseStarted = 0;
+  sosPhaseDuration = 0;
+
+  Serial.println("FALL DETECTED - SOS ACTIVE");
+  Serial1.println("ALERT:FALL");
+}
+
+void cancelSOS() {
+  systemMode = SystemMode::NORMAL;
+  fallStage = FallStage::COOLDOWN;
+  fallStageStarted = millis();
+  setBuzzer(false);
+  setLedMode(LedMode::OFF);
+
+  Serial.println("SOS CANCELLED");
+  Serial1.println("ALERT:CANCELLED");
+}
+
+void updateSOS() {
+  if (cancelButton.pressed()) {
+    cancelSOS();
+    return;
+  }
+
+  const uint32_t now = millis();
+
+  if (sosPhaseDuration > 0 && now - sosPhaseStarted < sosPhaseDuration) {
+    return;
+  }
+
+  if (sosSignalOn) {
+    // Finish the current dot or dash and begin its gap.
+    sosSignalOn = false;
+    setLedMode(LedMode::OFF);
+    setBuzzer(false);
+
+    uint16_t gap = ELEMENT_GAP_MS;
+
+    if (sosIndex == 2 || sosIndex == 5) {
+      gap = LETTER_GAP_MS;
+    } else if (sosIndex == SOS_COUNT - 1) {
+      gap = REPEAT_GAP_MS;
+    }
+
+    sosIndex++;
+    sosPhaseStarted = now;
+    sosPhaseDuration = gap;
+    return;
+  }
+
+  if (sosIndex >= SOS_COUNT) {
+    sosIndex = 0;
+  }
+
+  // Start the next dot or dash.
+  sosSignalOn = true;
+  setLedMode(LedMode::BLUE);
+  setBuzzer(true);
+  sosPhaseStarted = now;
+  sosPhaseDuration = SOS_PATTERN[sosIndex];
+}
+
+void setBuzzer(bool on) {
+  if (on == buzzerOn) {
+    return;
+  }
+
+  buzzerOn = on;
+
+  if (on) {
+    tone(BUZZER_PIN, BUZZER_FREQUENCY);
+  } else {
+    noTone(BUZZER_PIN);
+  }
+}
+
+void setLedMode(LedMode mode) {
+  if (mode == currentLedMode) {
+    return;
+  }
+
+  currentLedMode = mode;
+  pixels.clear();
+
+  if (mode == LedMode::READY) {
+    pixels.setPixelColor(3, pixels.Color(0, 100, 0, 0));
+    pixels.setPixelColor(4, pixels.Color(0, 100, 0, 0));
+  } else {
+    uint32_t color = 0;
+
+    if (mode == LedMode::WHITE) {
+      color = pixels.Color(0, 0, 0, 255);
+    } else if (mode == LedMode::RED) {
+      color = pixels.Color(255, 0, 0, 0);
+    } else if (mode == LedMode::BLUE) {
+      color = pixels.Color(0, 0, 255, 0);
+    }
+
+    if (mode != LedMode::OFF && mode != LedMode::UNKNOWN) {
+      for (uint8_t i = 0; i < NUM_PIXELS; i++) {
+        pixels.setPixelColor(i, color);
+      }
+    }
+  }
+
+  pixels.show();
+}
+
+void printStatus() {
+  Serial.print("LDR: ");
+  Serial.print(lightLevel);
+
+  Serial.print(" | Distance: ");
+  if (distanceCm >= 999.0f) {
+    Serial.print("NO ECHO");
+  } else {
+    Serial.print(distanceCm, 1);
+    Serial.print(" cm");
+  }
+
+  Serial.print(" | Obstacle: ");
+  Serial.print(distanceCm <= OBSTACLE_THRESHOLD_CM ? "YES" : "NO");
+
+  Serial.print(" | Accel: ");
+  Serial.print(accelMagnitudeG, 2);
+  Serial.println(" g");
+}
