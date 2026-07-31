@@ -7,7 +7,7 @@
 const int buzzerPin = 13;
 
 // SOS
-const int cancelButtonPin = 3;
+const int cancelButtonPin = 7;
 bool sosMode = false;
 const int DOT = 150;
 const int DASH = 450;
@@ -38,7 +38,7 @@ float accelMag = 1.0;
 bool fallDetect();
 
 // Button
-const int buttonPin = 2;
+const int buttonPin = 6;
 bool lastButtonState;
 bool systemOn = false;
 
